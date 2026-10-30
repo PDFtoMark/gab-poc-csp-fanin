@@ -1,0 +1,108 @@
+name: Collect & Parse Artifacts (fan-in)
+
+on:
+  workflow_run:
+    workflows: ["Rust Benchmarks (parallel)", "Non-Rust Benchmarks (parallel)"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    env:
+      SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+      GH_TOKEN: ${{ github.token }}
+      REQUIRED_WORKFLOWS_JSON: '["Rust Benchmarks (parallel)", "Non-Rust Benchmarks (parallel)"]'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Gate - proceed only when all parent workflows completed for this commit"
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Target SHA: $SHA"
+          all_done=true
+          while IFS= read -r wf; do
+            run_json=$(gh run list --workflow "$wf" --limit 50 \
+              --json databaseId,headSha,conclusion,status,workflowName \
+              --jq "map(select(.headSha==\"$SHA\"))[0]")
+            echo "lookup[$wf] = $run_json"
+            if [[ "$run_json" == "null" || -z "$run_json" ]]; then
+              all_done=false
+              continue
+            fi
+            status=$(jq -r '.status' <<<"$run_json")
+            if [[ "$status" != "completed" ]]; then all_done=false; fi
+          done < <(jq -r '.[]' <<<"$REQUIRED_WORKFLOWS_JSON")
+          if ! $all_done; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts from each parent run
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p inbox
+          while IFS= read -r wf; do
+            RUN_ID=$(gh run list --workflow "$wf" --limit 50 \
+              --json databaseId,headSha \
+              --jq "map(select(.headSha==\"$SHA\"))[0].databaseId")
+            [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]] && continue
+            echo "Downloading artifacts for $wf (run_id=$RUN_ID)"
+            gh run download "$RUN_ID" --dir "inbox/$wf" || echo "no artifacts"
+          done < <(jq -r '.[]' <<<"$REQUIRED_WORKFLOWS_JSON")
+          find inbox -maxdepth 3 -print
+
+      - name: Stage downloaded artifacts into workspace
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p target/criterion
+          while IFS= read -r -d '' critroot; do
+            echo "Merging Criterion artifact: $critroot"
+            rsync -a "$critroot"/ target/criterion/
+          done < <(find inbox -type d -maxdepth 3 -name 'criterion-*' -print0)
+
+          while IFS= read -r -d '' outdir; do
+            sys="$(basename "$outdir")"
+            sys="${sys#benchmark-outputs-}"
+            mkdir -p "$sys"
+            if [[ -d "$outdir/$sys" ]]; then
+              cp -a "$outdir/$sys/"*_metrics.json "$sys"/ || true
+            else
+              cp -a "$outdir/"*_metrics.json "$sys"/ || true
+            fi
+          done < <(find inbox -type d -name 'benchmark-outputs-*' -print0)
+
+          while IFS= read -r -d '' mdir; do
+            crate="$(basename "$mdir")"
+            crate="${crate#metrics-}"
+            mkdir -p "$crate"
+            if [[ -d "$mdir/$crate" ]]; then
+              cp -a "$mdir/$crate/"*_metrics.json "$crate"/ || true
+            else
+              cp -a "$mdir/"*_metrics.json "$crate"/ || true
+            fi
+          done < <(find inbox -type d -name 'metrics-*' -print0)
+
+          echo "=== staged metrics files (attacker-controlled JSON) ==="
+          find . -maxdepth 2 -name "*_metrics.json" -print -exec cat {} \;
+
+      - name: Simulated collect output
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PROCEED=true: the following attacker-supplied metrics were accepted as build input:"
+          find . -maxdepth 2 -name "*_metrics.json" -print -exec cat {} \;
+          echo "VERDICT_ATTACKER_ARTIFACT_ACCEPTED"
